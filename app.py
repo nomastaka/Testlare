@@ -3,288 +3,411 @@ import os
 import time
 import uuid
 import threading
+import statistics
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 
-import gradio as gr
 import requests
+import gradio as gr
 from fastapi import FastAPI
-import uvicorn
+from fastapi.responses import JSONResponse
 
 
-# Informational quotas only — these are not live account usage.
-PLAN_LIMITS = {
-    "Free — 100,000 requests/day": 100_000,
-    "Paid — 10 million requests/month included": 10_000_000,
+# --------------------------------------------------
+# Configuration: deliberately bounded test limits
+# --------------------------------------------------
+
+MAX_REQUESTS = 500
+MAX_DURATION_SECONDS = 120
+MAX_REQUESTS_PER_SECOND = 2
+REQUEST_TIMEOUT_SECONDS = 8
+MAX_ERROR_RATE = 0.20
+MIN_ERRORS_FOR_ABORT = 5
+
+# Set this to a Worker or staging endpoint you own
+# and are authorized to test. If unset, the app runs
+# a local simulation and sends no external requests.
+TEST_TARGET_URL = os.getenv("TEST_TARGET_URL", "").strip()
+
+# Refuse the third-party lookup service discussed
+# earlier, even if it is accidentally configured.
+BLOCKED_HOSTS = {"free.proapis.bond"}
+
+
+def validate_target():
+    if not TEST_TARGET_URL:
+        return None
+
+    parsed = urlparse(TEST_TARGET_URL)
+
+    if parsed.scheme != "https" or not parsed.hostname:
+        raise ValueError("TEST_TARGET_URL must be a valid HTTPS URL.")
+
+    if parsed.hostname.lower() in BLOCKED_HOSTS:
+        raise ValueError(
+            "This dashboard cannot load-test free.proapis.bond."
+        )
+
+    if parsed.username or parsed.password:
+        raise ValueError("URLs containing credentials are not allowed.")
+
+    return TEST_TARGET_URL
+
+
+app = FastAPI(title="Worker Capacity Test Dashboard")
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "app": "worker-capacity-dashboard",
+        "time": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# --------------------------------------------------
+# Shared background-job state
+# --------------------------------------------------
+
+lock = threading.Lock()
+stop_event = threading.Event()
+
+job = {
+    "running": False,
+    "run_id": None,
+    "status": "Idle",
+    "total": 0,
+    "completed": 0,
+    "successes": 0,
+    "errors": 0,
+    "latencies": [],
+    "logs": [],
+    "started_at": None,
+    "finished_at": None,
+    "target": "Local simulation",
 }
 
-MAX_TEST_REQUESTS = 20
-REQUEST_TIMEOUT = 10
 
-jobs = {}
-jobs_lock = threading.Lock()
+def log(message):
+    stamp = datetime.now().strftime("%H:%M:%S")
+    with lock:
+        job["logs"].append(f"[{stamp}] {message}")
+        job["logs"] = job["logs"][-100:]
 
 
-def worker_test(job_id, url, count, delay):
-    started_at = time.monotonic()
+def simulated_request():
+    """Exercise the dashboard without contacting another service."""
+    time.sleep(0.05)
+    return 200
 
-    with jobs_lock:
-        jobs[job_id]["status"] = "Running"
+
+def execute_test(total_requests, requests_per_second):
+    run_id = uuid.uuid4().hex
+    target = validate_target()
+    simulation = target is None
+
+    with lock:
+        job.update({
+            "running": True,
+            "run_id": run_id,
+            "status": "Running",
+            "total": total_requests,
+            "completed": 0,
+            "successes": 0,
+            "errors": 0,
+            "latencies": [],
+            "logs": [],
+            "started_at": time.time(),
+            "finished_at": None,
+            "target": "Local simulation" if simulation else target,
+        })
+
+    stop_event.clear()
+    log(f"Test started: {run_id}")
+    log(f"Mode: {'simulation' if simulation else 'authorized endpoint'}")
+    log(f"Request limit: {total_requests}")
+    log(f"Rate limit: {requests_per_second} requests/second")
+
+    interval = 1.0 / requests_per_second
+    next_request_at = time.monotonic()
 
     session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Workers-Connectivity-Tester/1.0"
-    })
 
     try:
-        for index in range(count):
-            request_started = time.monotonic()
+        for index in range(total_requests):
+            if stop_event.is_set():
+                log("Stop requested.")
+                break
+
+            elapsed = time.time() - job["started_at"]
+            if elapsed >= MAX_DURATION_SECONDS:
+                log("Maximum test duration reached.")
+                break
+
+            # Keep the request rate bounded.
+            wait = next_request_at - time.monotonic()
+            if wait > 0 and stop_event.wait(wait):
+                break
+
+            started = time.perf_counter()
+            status_code = None
+            error_message = None
 
             try:
-                response = session.get(
-                    url,
-                    timeout=REQUEST_TIMEOUT,
-                    allow_redirects=False,
-                )
+                if simulation:
+                    status_code = simulated_request()
+                else:
+                    response = session.get(
+                        target,
+                        headers={
+                            "X-Capacity-Test-ID": run_id,
+                            "X-Test-Request-ID": f"{run_id}-{index + 1}",
+                            "User-Agent": "AuthorizedCapacityTest/1.0",
+                        },
+                        timeout=REQUEST_TIMEOUT_SECONDS,
+                    )
+                    status_code = response.status_code
+                    response.close()
 
-                duration = (
-                    time.monotonic() - request_started
-                ) * 1000
-
-                success = 200 <= response.status_code < 400
-
-                line = (
-                    f"Request {index + 1}/{count}: "
-                    f"HTTP {response.status_code} — "
-                    f"{duration:.0f} ms"
-                )
-
-                response.close()
+                latency_ms = (time.perf_counter() - started) * 1000
+                success = 200 <= status_code < 400
 
             except requests.RequestException as exc:
+                latency_ms = (time.perf_counter() - started) * 1000
                 success = False
-                line = (
-                    f"Request {index + 1}/{count}: "
-                    f"ERROR — {exc}"
+                error_message = str(exc)[:180]
+
+            with lock:
+                job["completed"] += 1
+                job["latencies"].append(round(latency_ms, 2))
+
+                if success:
+                    job["successes"] += 1
+                else:
+                    job["errors"] += 1
+
+                completed = job["completed"]
+                errors = job["errors"]
+
+            if error_message:
+                log(f"Request {index + 1}: network error: {error_message}")
+            else:
+                log(
+                    f"Request {index + 1}: HTTP {status_code}, "
+                    f"{latency_ms:.1f} ms"
                 )
 
-            with jobs_lock:
-                job = jobs[job_id]
-                job["done"] += 1
-                job["success"] += int(success)
-                job["logs"].append(line)
+            # Stop early if errors suggest the endpoint is struggling.
+            if completed >= 10 and errors >= MIN_ERRORS_FOR_ABORT:
+                error_rate = errors / completed
+                if error_rate >= MAX_ERROR_RATE:
+                    log(
+                        f"Stopped automatically: error rate "
+                        f"{error_rate:.0%} reached the safety threshold."
+                    )
+                    break
 
-            if index < count - 1:
-                time.sleep(delay)
+            next_request_at = max(
+                next_request_at + interval,
+                time.monotonic(),
+            )
+
+    except Exception as exc:
+        log(f"Test runner error: {str(exc)[:180]}")
 
     finally:
         session.close()
 
-        with jobs_lock:
-            job = jobs.get(job_id)
-            if job:
+        with lock:
+            job["running"] = False
+            job["finished_at"] = time.time()
+
+            if stop_event.is_set():
+                job["status"] = "Stopped"
+            elif job["completed"] >= job["total"]:
                 job["status"] = "Completed"
-                job["elapsed"] = (
-                    time.monotonic() - started_at
-                )
+            elif job["status"] == "Running":
+                job["status"] = "Finished early"
+
+        log(f"Test ended. Completed {job['completed']} requests.")
 
 
-def start_test(url, plan, count, delay, confirmed):
-    if not confirmed:
-        raise gr.Error(
-            "Confirm that you own the endpoint or have "
-            "permission to test it."
-        )
-
-    url = url.strip()
-    parsed = urlparse(url)
-
-    if (
-        parsed.scheme != "https"
-        or not parsed.hostname
-        or parsed.username
-        or parsed.password
-    ):
-        raise gr.Error(
-            "Enter a valid HTTPS URL, such as "
-            "https://your-worker.workers.dev"
-        )
+def start_test(request_count, rate):
+    with lock:
+        if job["running"]:
+            return "A test is already running."
 
     try:
-        count = int(count)
-        delay = float(delay)
-    except (TypeError, ValueError):
-        raise gr.Error("Invalid request count or delay.")
+        validate_target()
+    except ValueError as exc:
+        return str(exc)
 
-    if not 1 <= count <= MAX_TEST_REQUESTS:
-        raise gr.Error("Choose between 1 and 20 requests.")
+    request_count = int(request_count)
+    rate = int(rate)
 
-    if not 1 <= delay <= 10:
-        raise gr.Error("Choose a delay between 1 and 10 seconds.")
+    if not 1 <= request_count <= MAX_REQUESTS:
+        return f"Request count must be between 1 and {MAX_REQUESTS}."
 
-    job_id = uuid.uuid4().hex[:10]
+    if not 1 <= rate <= MAX_REQUESTS_PER_SECOND:
+        return f"Rate must be between 1 and {MAX_REQUESTS_PER_SECOND} requests/second."
 
-    with jobs_lock:
-        jobs[job_id] = {
-            "status": "Starting",
-            "done": 0,
-            "success": 0,
-            "logs": [],
-            "start": time.monotonic(),
-            "elapsed": 0,
-            "count": count,
-            "plan": plan,
-        }
+    stop_event.clear()
 
     thread = threading.Thread(
-        target=worker_test,
-        args=(job_id, url, count, delay),
+        target=execute_test,
+        args=(request_count, rate),
         daemon=True,
     )
     thread.start()
 
-    return job_id, "Test started.", ""
+    return "Test started."
 
 
-def refresh(job_id):
-    if not job_id:
-        return "Ready. Configure your test and press Start.", ""
+def stop_test():
+    with lock:
+        if not job["running"]:
+            return "No test is currently running."
 
-    with jobs_lock:
-        job = jobs.get(job_id)
-
-        if not job:
-            return (
-                "Job not found. The service may have restarted.",
-                "",
-            )
-
-        done = job["done"]
-        total = job["count"]
-        elapsed = time.monotonic() - job["start"]
-
-        rate = done / elapsed if elapsed > 0 else 0
-        remaining = (
-            (total - done) / rate if rate > 0 else 0
-        )
-
-        quota = PLAN_LIMITS[job["plan"]]
-        percent = 100 * done / total
-
-        summary = (
-            f"Status: {job['status']}\n"
-            f"Progress: {done}/{total} ({percent:.0f}%)\n"
-            f"Successful responses: {job['success']}\n"
-            f"Failed or non-success responses: "
-            f"{done - job['success']}\n"
-            f"Elapsed time: {elapsed:.1f} seconds\n"
-            f"Estimated remaining: {remaining:.1f} seconds\n"
-            f"Average rate: {rate:.2f} requests/second\n"
-            f"Selected plan: {job['plan']}\n"
-            f"Illustrative plan quota: {quota:,}\n"
-            "Quota is not live account usage."
-        )
-
-        log_text = "\n".join(job["logs"])
-
-    return summary, log_text
+    stop_event.set()
+    return "Stop requested. The current request may need to finish first."
 
 
-# FastAPI application used by Render's health check.
-api = FastAPI(title="Workers Test Dashboard")
+def refresh_dashboard():
+    with lock:
+        completed = job["completed"]
+        total = job["total"]
+        successes = job["successes"]
+        errors = job["errors"]
+        latencies = list(job["latencies"])
+        running = job["running"]
+        status = job["status"]
+        run_id = job["run_id"] or "-"
+        target = job["target"]
+        logs = list(job["logs"])
+
+        started_at = job["started_at"]
+        finished_at = job["finished_at"]
+
+    progress = (completed / total * 100) if total else 0
+
+    elapsed_end = time.time() if running else finished_at
+    elapsed = (
+        max(0, elapsed_end - started_at)
+        if started_at and elapsed_end
+        else 0
+    )
+
+    rps = completed / elapsed if elapsed > 0 else 0
+    avg_latency = statistics.mean(latencies) if latencies else 0
+    p95_latency = (
+        sorted(latencies)[min(len(latencies) - 1, int(len(latencies) * 0.95))]
+        if latencies else 0
+    )
+    error_rate = errors / completed * 100 if completed else 0
+
+    metrics = (
+        f"**Status:** {status}\n\n"
+        f"**Run ID:** `{run_id}`\n\n"
+        f"**Target:** `{target}`\n\n"
+        f"**Requests:** {completed} / {total}\n\n"
+        f"**Successful:** {successes}\n\n"
+        f"**Errors:** {errors} ({error_rate:.1f}%)\n\n"
+        f"**Elapsed:** {elapsed:.1f} seconds\n\n"
+        f"**Observed throughput:** {rps:.2f} requests/second\n\n"
+        f"**Average latency:** {avg_latency:.1f} ms\n\n"
+        f"**Approx. p95 latency:** {p95_latency:.1f} ms"
+    )
+
+    return (
+        progress,
+        metrics,
+        "\n".join(logs[-40:]) or "No requests yet.",
+        "Running" if running else status,
+    )
 
 
-@api.get("/health", include_in_schema=False)
-def health_check():
-    return {"status": "ok"}
+# --------------------------------------------------
+# Gradio UI
+# --------------------------------------------------
 
-
-# Build the Gradio interface.
-with gr.Blocks(title="Workers Test Dashboard") as demo:
-    gr.Markdown("# Cloudflare Workers Test Dashboard")
-
+with gr.Blocks(title="Worker Capacity Dashboard") as demo:
     gr.Markdown(
-        "Check connectivity, response times, and test progress. "
-        "This dashboard does not read your Cloudflare account "
-        "analytics."
+        "# Cloudflare Worker Capacity Dashboard\n"
+        "Run a bounded test, watch request latency, and stop early "
+        "if the error rate rises. This app does not measure Worker CPU "
+        "directly; check Cloudflare Analytics for that."
     )
 
-    url = gr.Textbox(
-        label="HTTPS endpoint you control",
-        placeholder="https://your-worker.workers.dev",
-    )
-
-    plan = gr.Dropdown(
-        choices=list(PLAN_LIMITS.keys()),
-        value="Free — 100,000 requests/day",
-        label="Plan to model (informational only)",
-    )
-
-    count = gr.Slider(
-        minimum=1,
-        maximum=MAX_TEST_REQUESTS,
-        value=5,
-        step=1,
-        label="Number of requests (maximum 20)",
-    )
-
-    delay = gr.Slider(
-        minimum=1,
-        maximum=10,
-        value=1,
-        step=1,
-        label="Delay between requests (seconds)",
-    )
-
-    confirmed = gr.Checkbox(
-        label=(
-            "I own this endpoint or have permission to test it."
+    if TEST_TARGET_URL:
+        gr.Markdown(
+            "**Configured endpoint:** `TEST_TARGET_URL` — ensure it is "
+            "your own Worker or an endpoint you are authorized to test."
         )
-    )
+    else:
+        gr.Markdown(
+            "**Simulation mode:** no external requests will be sent. "
+            "Set `TEST_TARGET_URL` to your authorized HTTPS test endpoint "
+            "to test actual request latency."
+        )
 
-    job_id = gr.Textbox(
-        label="Job ID",
+    with gr.Row():
+        request_count = gr.Slider(
+            minimum=1,
+            maximum=MAX_REQUESTS,
+            value=50,
+            step=1,
+            label=f"Maximum requests (up to {MAX_REQUESTS})",
+        )
+        rate = gr.Slider(
+            minimum=1,
+            maximum=MAX_REQUESTS_PER_SECOND,
+            value=1,
+            step=1,
+            label="Request rate (requests/second)",
+        )
+
+    with gr.Row():
+        start_button = gr.Button("Start test", variant="primary")
+        stop_button = gr.Button("Stop test", variant="stop")
+
+    message = gr.Textbox(label="Test controls", interactive=False)
+    status = gr.Textbox(label="Current status", value="Idle", interactive=False)
+    progress = gr.Slider(
+        minimum=0,
+        maximum=100,
+        value=0,
+        step=1,
+        label="Progress (%)",
         interactive=False,
     )
 
-    start_button = gr.Button(
-        "Start connectivity test",
-        variant="primary",
-    )
-
-    summary = gr.Textbox(
-        label="Live progress",
-        lines=10,
-    )
-
+    metrics = gr.Markdown("Metrics will appear here.")
     logs = gr.Textbox(
-        label="Request log",
-        lines=10,
+        label="Recent request log",
+        lines=12,
+        max_lines=20,
+        interactive=False,
+    )
+
+    timer = gr.Timer(1)
+    timer.tick(
+        fn=refresh_dashboard,
+        inputs=[],
+        outputs=[progress, metrics, logs, status],
     )
 
     start_button.click(
         fn=start_test,
-        inputs=[url, plan, count, delay, confirmed],
-        outputs=[job_id, summary, logs],
-        queue=False,
+        inputs=[request_count, rate],
+        outputs=[message],
     )
 
-    timer = gr.Timer(1)
-
-    timer.tick(
-        fn=refresh,
-        inputs=[job_id],
-        outputs=[summary, logs],
-        queue=False,
+    stop_button.click(
+        fn=stop_test,
+        inputs=[],
+        outputs=[message],
     )
 
 
-# Mount Gradio at / while preserving the /health endpoint.
-app = gr.mount_gradio_app(api, demo, path="/")
-
-
-if __name__ == "__main__":
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=int(os.environ.get("PORT", "10000")),
-    )
+app = gr.mount_gradio_app(app, demo, path="/")
